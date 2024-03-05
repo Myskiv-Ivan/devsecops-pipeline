@@ -1,0 +1,230 @@
+stages:
+  - security
+
+variables:
+  DD_URL: 'https://<DEFECTDOJO>'
+  DD_API_KEY: "$API_KEY"
+  DD_SERVICE: 'dd-import'
+  DD_BUILD_ID: "$CI_PIPELINE_ID"
+  DD_SSL_VERIFY: '0'
+  DD_PROJECT_SCAN: '$CI_PROJECT_DIR'
+
+  DD_PRODUCT_TYPE_NAME: "$CI_PROJECT_ROOT_NAMESPACE"
+  DD_PRODUCT_NAME: "$CI_PROJECT_ROOT_NAMESPACE-$CI_PROJECT_NAME"
+
+  DD_PROJECT_TYPE: $CI_PROJECT_ROOT_NAMESPACE
+  DD_PROJECT_NAME: $CI_PROJECT_ROOT_NAMESPACE-$CI_PROJECT_NAME
+  
+  DD_PROJECT_DESCRIPTION: ${CI_PROJECT_URL}
+  DD_ENGAGEMENT_NAME: ${CI_PIPELINE_ID}-${CI_PROJECT_TITLE}
+  DD_REPO_URL: ${CI_PROJECT_URL}/-/tree/${CI_COMMIT_BRANCH}
+
+  #SEC_EXCLUDE_PATH: '$CI_PROJECT_DIR/$REPORT_FILE_NAME'
+  
+.needs_init:
+  needs: 
+    - job: init
+      artifacts: true
+
+.allow_failure:
+  allow_failure: true
+
+init:
+  stage: security
+  #tags: [ appsec-agent01 ]
+  before_script: []
+  after_script: []
+  script:
+     - |
+      set -xe
+      env | grep "DD_"
+
+      echo "CIB---------- Env AppSecScan ------------CIB"
+
+      if [ "$DD_PROJECT_TYPE" == "" ]; then
+        export DD_PROJECT_TYPE="$CI_PROJECT_ROOT_NAMESPACE"
+      fi
+
+      if [ "$DD_PROJECT_NAME" == "" ]; then
+        export DD_PROJECT_NAME="$CI_PROJECT_ROOT_NAMESPACE-$CI_PROJECT_NAME"
+      fi
+
+      if [ "$DD_PROJECT_DESCRIPTION" == "" ]; then
+        export DD_PROJECT_DESCRIPTION=${CI_PROJECT_URL}
+      fi    
+
+      if [ "$DD_REPO_URL" == "" ]; then
+        export DD_REPO_URL="${CI_PROJECT_URL}/-/tree/${CI_COMMIT_BRANCH}"
+      fi
+
+      echo "CIB---------- Create Product Type -> ${DD_PROJECT_TYPE} ------------CIB"
+      product_type_post_data()
+      {
+      cat <<EOF
+      {
+          "name": "$DD_PROJECT_TYPE"
+      }
+      EOF
+      }
+      
+      curl -s --insecure -XPOST "$DD_URL/api/v2/product_types/" \
+          -H "Content-Type: application/json" \
+          -H "Authorization: Token $DD_API_KEY"  \
+          -d "$(product_type_post_data)"
+     
+      DD_PRODUCT_TYPE_ID=$(curl -s --insecure -XGET "$DD_URL/api/v2/product_types/?name=$DD_PROJECT_TYPE" \
+          -H "Content-Type: application/json" \
+          -H "Authorization: Token $DD_API_KEY"  \
+          -d "$(product_type_post_data)" | jq --arg PROJECT_TYPE_NAME $DD_PROJECT_TYPE '.results[] | select(.name == $PROJECT_TYPE_NAME) | .id')
+      
+      echo "CIB---------- Create Product Name -> ${DD_PROJECT_NAME} ------------CIB"
+      product_post_data()
+      {
+      cat <<EOF
+      {
+          "name": "$DD_PROJECT_NAME",
+          "description": "Project URL $DD_PROJECT_DESCRIPTION\nProject Path $CI_PROJECT_PATH\nMerge $CI_MERGE_REQUEST_DESCRIPTION",
+          "prod_type": $DD_PRODUCT_TYPE_ID
+      }
+      EOF
+      }
+      curl -s --insecure -XPOST "$DD_URL/api/v2/products/" \
+          -H "Content-Type: application/json" \
+          -H "Authorization: Token $DD_API_KEY"  \
+          -d "$(product_post_data)" | jq
+              
+      
+      echo "CIB---------- Get Product ID -> $DD_PRODUCT_ID ------------CIB"
+      DD_PRODUCT_ID=$(curl -s -XGET --insecure "$DD_URL/api/v2/products/?name=$DD_PROJECT_NAME" \
+          -H  "Authorization: Token $DD_API_KEY" \
+          | jq --arg PROJECT_NAME $DD_PROJECT_NAME '.results[] | select(.name == $PROJECT_NAME) | .id')
+
+
+      echo "CIB---------- Create Engagement -> ${CI_PIPELINE_ID}-${CI_PROJECT_TITLE} ------------CIB"
+      engagement_post_data()
+      {
+      cat <<EOF
+      {
+          "target_start": "$(date +%F)",
+          "target_end": "$(date +%F)",
+          "product": "${DD_PRODUCT_ID}",
+          "name": "${CI_PIPELINE_ID}-${CI_PROJECT_TITLE}",
+          "build_id": "${CI_PIPELINE_ID}",
+          "commit_hash": "${CI_COMMIT_SHORT_SHA}",
+          "description": "Build number ${CI_PIPELINE_ID}\nLatest commit by ${CI_COMMIT_AUTHOR}\nRepo URL $DD_REPO_URL\nCommit tag ${CI_COMMIT_TAG}",
+          "source_code_management_uri": "${DD_REPO_URL}",
+          "engagement_type": "CI/CD"
+      }
+      EOF
+      }
+      DD_ENGAGEMENT_ID=$(curl -s --insecure -XPOST "$DD_URL/api/v2/engagements/" \
+          -H "Content-Type: application/json" \
+          -H "Authorization: Token $DD_API_KEY"  \
+          -d "$(engagement_post_data)" | jq '.id')
+          
+      echo "DD_PRODUCT_ID=$DD_PRODUCT_ID" >> variables.env
+      echo "DD_PRODUCT_TYPE_NAME=$DD_PRODUCT_TYPE_NAME" >> variables.env
+        echo "DD_PRODUCT_NAME=$DD_PRODUCT_NAME" >> variables.env
+        echo "DD_PROJECT_NAME=$DD_PROJECT_NAME" >> variables.env
+            echo "DD_ENGAGEMENT_ID=$DD_ENGAGEMENT_ID" >> variables.env
+            echo "DD_ENGAGEMENT_NAME=$DD_ENGAGEMENT_NAME" >> variables.env
+      cat variables.env
+      cat $DD_ART
+      
+semgrep:
+  stage: security
+  image: returntocorp/semgrep
+  tags: [ appsec-agent01 ]
+  variables:   
+    DD_TEST_NAME: 'Semgrep'
+    DD_TEST_TYPE_NAME: 'Semgrep JSON Report'
+    DD_FILE_NAME: 'semgrep.json'   
+    REPORT_FILE_NAME: 'semgrep.json'
+    SEC_SEMGREP_CONFIG: 'p/auto'
+    DD_GROUP_BY: 'file_path'
+  before_script: []
+  after_script: []
+  script:
+    - echo "Scanning code with - $CI_REGISTRY_IMAGE"
+    - semgrep scan --config $SEC_SEMGREP_CONFIG $CI_PROJECT_DIR --json -o $REPORT_FILE_NAME -v
+    - /home/appsec/dd-import-main/bin/dd-reimport-findings.sh
+    - cat $DD_ART
+  extends:
+    - .needs_init
+    - .allow_failure
+
+trivy:
+  stage: security
+  tags: [ appsec-agent01 ]
+  variables:
+    DD_TEST_NAME: 'Trivy'
+    DD_TEST_TYPE_NAME: 'Trivy Scan'
+    DD_FILE_NAME: 'trivy.json'
+    REPORT_FILE_NAME: 'trivy.json'
+    DD_GROUP_BY: 'component_name'
+  before_script: []
+  after_script: []
+  script:
+    - trivy fs $CI_PROJECT_DIR -f json -o $REPORT_FILE_NAME --skip-dirs ./semgrep.json
+    - /home/appsec/dd-import-main/bin/dd-reimport-findings.sh
+    - cat $DD_ART
+  extends:
+    - .needs_init
+    - .allow_failure
+    
+checkov:
+  stage: security
+  tags: [ appsec-agent01 ]
+  variables:
+    DD_TEST_NAME: 'Checkov'
+    DD_TEST_TYPE_NAME: 'Checkov Scan'
+    DD_FILE_NAME: 'results_json.json'
+    DD_GROUP_BY: 'file_path'
+    DD_REPORT_FILE_NAME: 'checkov.json'
+  before_script: []
+  after_script: []
+  script:
+    - checkov -d $CI_PROJECT_DIR -o json --output-file-path $REPORT_FILE_NAME . --soft-fail
+    - /home/appsec/dd-import-main/bin/dd-reimport-findings.sh
+    - cat $DD_ART
+  extends:
+    - .needs_init
+    - .allow_failure
+
+dependency_check:
+  stage: security
+  tags: [ appsec-agent01 ]
+  variables:
+    JAVA_HOME: /opt/jdk-13.0.1
+    DD_TEST_NAME: 'Dependency Check'
+    DD_TEST_TYPE_NAME: 'Dependency Check Scan'
+    DD_FILE_NAME: 'dependency-check-report.xml'
+    DD_GROUP_BY: 'component_name'
+    DD_REPORT_FILE_NAME: 'dependency-check-report.xml'
+  before_script: []
+  after_script: []
+  script:
+    - /home/appsec/dependency-check/bin/dependency-check.sh --out $DD_REPORT_FILE_NAME -f XML --scan $CI_PROJECT_DIR --exclude '**/semgrep.json' --exclude '**/chekov.json' --exclude '**/trivy.json'
+    - /home/appsec/dd-import-main/bin/dd-reimport-findings.sh
+    - cat $DD_ART
+  extends:
+    - .needs_init
+    - .allow_failure
+
+gitleaks:
+  stage: security
+  tags: [ appsec-agent01 ]
+  variables:
+    DD_TEST_NAME: 'Gitleaks'
+    DD_TEST_TYPE_NAME: 'Gitleaks Scan'
+    DD_FILE_NAME: 'gitleaks.json'
+    DD_REPORT_FILE_NAME: 'gitleaks.json'
+  before_script: []
+  after_script: []
+  script:
+    - /home/appsec/gitleaks/gitleaks detect -s $CI_PROJECT_DIR -f json -r $DD_REPORT_FILE_NAME --exit-code 0
+    - /home/appsec/dd-import-main/bin/dd-reimport-findings.sh
+    - cat $DD_ART
+  extends:
+    - .needs_init
+    - .allow_failure
